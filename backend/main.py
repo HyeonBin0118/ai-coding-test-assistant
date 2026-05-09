@@ -15,6 +15,7 @@ from .config import CAPTURE_INTERVAL, CHANGE_THRESHOLD, LLM_PROVIDER
 from screen_capture.change_detector import start_monitor
 from screen_capture.problem_fetcher import fetch_problem_by_url
 
+
 if LLM_PROVIDER == "openai":
     from .llm.openai_client import OpenAIClient
     llm = OpenAIClient()
@@ -22,23 +23,35 @@ else:
     from .llm.gemini_client import GeminiClient
     llm = GeminiClient()
 
+
+CACHE_FILE = Path("poc/output/extracted_problem.json")
 problem_cache: dict = {}
 response_cache: dict = {}
-CACHE_FILE = Path("poc/output/extracted_problem.json")
 
 
-def _load_cache():
-    if CACHE_FILE.exists():
-        try:
-            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-            if data.get("is_coding_problem"):
-                problem_cache.update(data)
-                print(f"cache loaded: {data.get('title', '-')}")
-        except Exception as e:
-            print(f"cache load error: {e}")
+def save_problem(result: dict) -> None:
+    problem_cache.clear()
+    problem_cache.update(result)
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 
-_load_cache()
+def load_cache() -> None:
+    if not CACHE_FILE.exists():
+        return
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if data.get("is_coding_problem"):
+            problem_cache.update(data)
+            print(f"cache loaded: {data.get('title', '-')}")
+    except Exception as e:
+        print(f"cache load error: {e}")
+
+
+load_cache()
 
 
 async def on_problem_change():
@@ -47,14 +60,8 @@ async def on_problem_change():
         title = result.get("title", "")
         if not result.get("is_coding_problem") or not title:
             return
-        problem_cache.clear()
-        problem_cache.update(result)
+        save_problem(result)
         response_cache.clear()
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_FILE.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
         print(f"problem updated: {title}")
     except Exception as e:
         print(f"fetch error: {e}")
@@ -87,16 +94,16 @@ async def resolve_problem(req_problem: Optional[Problem] = None) -> Problem:
     try:
         result = await fetch_problem_by_url()
         if result.get("is_coding_problem"):
-            problem_cache.update(result)
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
+            save_problem(result)
             return Problem(**problem_cache)
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
     raise HTTPException(status_code=404, detail="no problem detected")
+
+
+def cached_response(key: str, content: str) -> AssistResponse:
+    response_cache[key] = content
+    return AssistResponse(content=content, provider=LLM_PROVIDER)
 
 
 @app.get("/health")
@@ -119,12 +126,7 @@ async def get_current_problem():
     try:
         result = await fetch_problem_by_url()
         if result.get("is_coding_problem"):
-            problem_cache.update(result)
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
+            save_problem(result)
         return problem_cache if problem_cache else result
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -132,59 +134,26 @@ async def get_current_problem():
 
 @app.post("/hint", response_model=AssistResponse)
 async def get_hint(req: AssistRequest):
-    problem = await resolve_problem(req.problem)
     if "hint" in response_cache:
         return AssistResponse(content=response_cache["hint"], provider=LLM_PROVIDER)
-    content = await llm.get_hint(problem)
-    response_cache["hint"] = content
-    return AssistResponse(content=content, provider=LLM_PROVIDER)
-
-
-@app.post("/hint/stream")
-async def stream_hint(req: AssistRequest):
     problem = await resolve_problem(req.problem)
-    async def generate():
-        async for chunk in llm.stream_hint(problem):
-            yield {"data": chunk}
-    return EventSourceResponse(generate())
+    return cached_response("hint", await llm.get_hint(problem))
 
 
 @app.post("/approach", response_model=AssistResponse)
 async def get_approach(req: AssistRequest):
-    problem = await resolve_problem(req.problem)
     if "approach" in response_cache:
         return AssistResponse(content=response_cache["approach"], provider=LLM_PROVIDER)
-    content = await llm.get_approach(problem)
-    response_cache["approach"] = content
-    return AssistResponse(content=content, provider=LLM_PROVIDER)
-
-
-@app.post("/approach/stream")
-async def stream_approach(req: AssistRequest):
     problem = await resolve_problem(req.problem)
-    async def generate():
-        async for chunk in llm.stream_approach(problem):
-            yield {"data": chunk}
-    return EventSourceResponse(generate())
+    return cached_response("approach", await llm.get_approach(problem))
 
 
 @app.post("/solution", response_model=AssistResponse)
 async def get_solution(req: AssistRequest):
-    problem = await resolve_problem(req.problem)
     if "solution" in response_cache:
         return AssistResponse(content=response_cache["solution"], provider=LLM_PROVIDER)
-    content = await llm.get_solution(problem)
-    response_cache["solution"] = content
-    return AssistResponse(content=content, provider=LLM_PROVIDER)
-
-
-@app.post("/solution/stream")
-async def stream_solution(req: AssistRequest):
     problem = await resolve_problem(req.problem)
-    async def generate():
-        async for chunk in llm.stream_solution(problem):
-            yield {"data": chunk}
-    return EventSourceResponse(generate())
+    return cached_response("solution", await llm.get_solution(problem))
 
 
 @app.post("/ask", response_model=AssistResponse)
@@ -194,10 +163,32 @@ async def ask(req: AskRequest):
     return AssistResponse(content=content, provider=LLM_PROVIDER)
 
 
+def _stream(generator):
+    async def gen():
+        async for chunk in generator:
+            yield {"data": chunk}
+    return EventSourceResponse(gen())
+
+
+@app.post("/hint/stream")
+async def stream_hint(req: AssistRequest):
+    problem = await resolve_problem(req.problem)
+    return _stream(llm.stream_hint(problem))
+
+
+@app.post("/approach/stream")
+async def stream_approach(req: AssistRequest):
+    problem = await resolve_problem(req.problem)
+    return _stream(llm.stream_approach(problem))
+
+
+@app.post("/solution/stream")
+async def stream_solution(req: AssistRequest):
+    problem = await resolve_problem(req.problem)
+    return _stream(llm.stream_solution(problem))
+
+
 @app.post("/ask/stream")
 async def stream_ask(req: AskRequest):
     problem = await resolve_problem(req.problem)
-    async def generate():
-        async for chunk in llm.stream_ask(problem, req.question, req.context or ""):
-            yield {"data": chunk}
-    return EventSourceResponse(generate())
+    return _stream(llm.stream_ask(problem, req.question, req.context or ""))
