@@ -9,14 +9,14 @@ class Problem(BaseModel):
     examples: list[dict]
 
 
-class AskRequest(BaseModel):
-    problem: Problem
-    question: str
-    context: Optional[str] = None  # 이전 대화 맥락
-
-
 class AssistRequest(BaseModel):
-    problem: Problem
+    problem: Optional[Problem] = None
+
+
+class AskRequest(BaseModel):
+    problem: Optional[Problem] = None
+    question: str
+    context: Optional[str] = None
 
 
 class AssistResponse(BaseModel):
