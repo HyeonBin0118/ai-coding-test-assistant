@@ -8,11 +8,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException
+from sse_starlette.sse import EventSourceResponse
+
 from .schemas.models import AssistRequest, AssistResponse, AskRequest, Problem
 from .config import CAPTURE_INTERVAL, CHANGE_THRESHOLD, LLM_PROVIDER
-from screen_capture.capture import capture_left_half
 from screen_capture.change_detector import start_monitor
-from screen_capture.problem_fetcher import fetch_problem_by_url, get_title_from_window
+from screen_capture.problem_fetcher import fetch_problem_by_url
 
 if LLM_PROVIDER == "openai":
     from .llm.openai_client import OpenAIClient
@@ -22,6 +23,7 @@ else:
     llm = GeminiClient()
 
 problem_cache: dict = {}
+response_cache: dict = {}
 CACHE_FILE = Path("poc/output/extracted_problem.json")
 
 
@@ -47,6 +49,7 @@ async def on_problem_change():
             return
         problem_cache.clear()
         problem_cache.update(result)
+        response_cache.clear()
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CACHE_FILE.write_text(
             json.dumps(result, ensure_ascii=False, indent=2),
@@ -62,6 +65,7 @@ async def on_title_change(title: str):
         problem_cache["title"] = title
         print(f"title updated: {title}")
         await on_problem_change()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -81,8 +85,7 @@ async def resolve_problem(req_problem: Optional[Problem] = None) -> Problem:
     if problem_cache:
         return Problem(**problem_cache)
     try:
-        img = capture_left_half()
-        result = await extract_problem(img)
+        result = await fetch_problem_by_url()
         if result.get("is_coding_problem"):
             problem_cache.update(result)
             CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +102,14 @@ async def resolve_problem(req_problem: Optional[Problem] = None) -> Problem:
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/status")
+async def get_status():
+    return {
+        "title": problem_cache.get("title", ""),
+        "has_problem": bool(problem_cache),
+    }
 
 
 @app.get("/extract")
@@ -119,7 +130,14 @@ async def get_current_problem():
         raise HTTPException(status_code=503, detail=str(e))
 
 
-from sse_starlette.sse import EventSourceResponse
+@app.post("/hint", response_model=AssistResponse)
+async def get_hint(req: AssistRequest):
+    problem = await resolve_problem(req.problem)
+    if "hint" in response_cache:
+        return AssistResponse(content=response_cache["hint"], provider=LLM_PROVIDER)
+    content = await llm.get_hint(problem)
+    response_cache["hint"] = content
+    return AssistResponse(content=content, provider=LLM_PROVIDER)
 
 
 @app.post("/hint/stream")
@@ -131,6 +149,16 @@ async def stream_hint(req: AssistRequest):
     return EventSourceResponse(generate())
 
 
+@app.post("/approach", response_model=AssistResponse)
+async def get_approach(req: AssistRequest):
+    problem = await resolve_problem(req.problem)
+    if "approach" in response_cache:
+        return AssistResponse(content=response_cache["approach"], provider=LLM_PROVIDER)
+    content = await llm.get_approach(problem)
+    response_cache["approach"] = content
+    return AssistResponse(content=content, provider=LLM_PROVIDER)
+
+
 @app.post("/approach/stream")
 async def stream_approach(req: AssistRequest):
     problem = await resolve_problem(req.problem)
@@ -138,6 +166,16 @@ async def stream_approach(req: AssistRequest):
         async for chunk in llm.stream_approach(problem):
             yield {"data": chunk}
     return EventSourceResponse(generate())
+
+
+@app.post("/solution", response_model=AssistResponse)
+async def get_solution(req: AssistRequest):
+    problem = await resolve_problem(req.problem)
+    if "solution" in response_cache:
+        return AssistResponse(content=response_cache["solution"], provider=LLM_PROVIDER)
+    content = await llm.get_solution(problem)
+    response_cache["solution"] = content
+    return AssistResponse(content=content, provider=LLM_PROVIDER)
 
 
 @app.post("/solution/stream")
@@ -149,6 +187,13 @@ async def stream_solution(req: AssistRequest):
     return EventSourceResponse(generate())
 
 
+@app.post("/ask", response_model=AssistResponse)
+async def ask(req: AskRequest):
+    problem = await resolve_problem(req.problem)
+    content = await llm.ask(problem, req.question, req.context or "")
+    return AssistResponse(content=content, provider=LLM_PROVIDER)
+
+
 @app.post("/ask/stream")
 async def stream_ask(req: AskRequest):
     problem = await resolve_problem(req.problem)
@@ -156,10 +201,3 @@ async def stream_ask(req: AskRequest):
         async for chunk in llm.stream_ask(problem, req.question, req.context or ""):
             yield {"data": chunk}
     return EventSourceResponse(generate())
-
-@app.get("/status")
-async def get_status():
-    return {
-        "title": problem_cache.get("title", ""),
-        "has_problem": bool(problem_cache),
-    }

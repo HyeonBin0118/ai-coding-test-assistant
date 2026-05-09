@@ -33,6 +33,19 @@ class ApiWorker(QThread):
                     self.finished.emit(content)
                 return
 
+            # 캐시 히트 확인 (일반 POST, 3초 안에 응답 오면 캐시 히트)
+            try:
+                with httpx.Client(timeout=3.0) as client:
+                    res = client.post(f"{API_BASE}{self.endpoint}", json=self.payload)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("content"):
+                            self.finished.emit(data["content"])
+                            return
+            except httpx.TimeoutException:
+                pass  # 캐시 미스 → 스트리밍으로
+
+            # 스트리밍
             stream_endpoint = self.endpoint + "/stream"
             with httpx.Client(timeout=60.0) as client:
                 with client.stream("POST", f"{API_BASE}{stream_endpoint}", json=self.payload) as res:
@@ -227,7 +240,7 @@ class Panel(QWidget):
         self.worker.chunk_received.connect(
             lambda chunk: self.response_box.insertPlainText(chunk)
         )
-        self.worker.finished.connect(lambda _: self._set_loading(False))
+        self.worker.finished.connect(self._on_response)
         self.worker.error.connect(self._on_error)
         self.worker.start()
 
@@ -241,9 +254,14 @@ class Panel(QWidget):
         self.worker.chunk_received.connect(
             lambda chunk: self.response_box.insertPlainText(chunk)
         )
-        self.worker.finished.connect(lambda _: self._set_loading(False))
+        self.worker.finished.connect(self._on_response)
         self.worker.error.connect(self._on_error)
         self.worker.start()
+
+    def _on_response(self, content: str):
+        if content:
+            self.response_box.setPlainText(content)
+        self._set_loading(False)
 
     def _on_error(self, msg: str):
         self.response_box.setPlainText(f"오류: {msg}")
