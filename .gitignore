@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+poc/output/
+*.png
+*.jpg
+.venv/
+venv/
+.pytest_cache/
+chromadb_data/
