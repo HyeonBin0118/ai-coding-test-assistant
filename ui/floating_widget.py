@@ -4,8 +4,8 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel,
     QTextEdit, QVBoxLayout, QHBoxLayout, QFrame,
 )
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QCursor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont
 
 
 API_BASE = "http://127.0.0.1:8000"
@@ -33,7 +33,6 @@ class ApiWorker(QThread):
                     self.finished.emit(content)
                 return
 
-            # 스트리밍 엔드포인트
             stream_endpoint = self.endpoint + "/stream"
             with httpx.Client(timeout=60.0) as client:
                 with client.stream("POST", f"{API_BASE}{stream_endpoint}", json=self.payload) as res:
@@ -47,6 +46,34 @@ class ApiWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
+
+
+class ProblemPoller(QThread):
+    problem_changed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._last_title = ""
+        self._running = True
+
+    def run(self):
+        while self._running:
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.get(f"{API_BASE}/status")
+                    res.raise_for_status()
+                    data = res.json()
+                    title = data.get("title", "")
+                    if title and title != self._last_title:
+                        self._last_title = title
+                        self.problem_changed.emit(title)
+            except Exception:
+                pass
+            self.msleep(2000)
+
+    def stop(self):
+        self._running = False
+
 
 class DraggableButton(QPushButton):
     def __init__(self, *args, **kwargs):
@@ -108,25 +135,23 @@ class Panel(QWidget):
             }
         """)
         self._build()
+        self._start_poller()
 
     def _build(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        # 문제 제목
         self.title_label = QLabel("문제를 불러오는 중...")
         self.title_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.title_label.setWordWrap(True)
         layout.addWidget(self.title_label)
 
-        # 구분선
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet("color: #313244;")
         layout.addWidget(line)
 
-        # 버튼 3개
         btn_layout = QHBoxLayout()
         self.btn_hint = QPushButton("힌트")
         self.btn_approach = QPushButton("접근법")
@@ -145,14 +170,12 @@ class Panel(QWidget):
             btn_layout.addWidget(btn)
         layout.addLayout(btn_layout)
 
-        # 응답 영역
         self.response_box = QTextEdit()
         self.response_box.setReadOnly(True)
         self.response_box.setMinimumHeight(200)
-        self.response_box.setPlaceholderText("힌트, 접근법, 정답 버튼을 눌러보세요.")
+        self.response_box.setPlaceholderText("")
         layout.addWidget(self.response_box)
 
-        # 자유 질문
         self.question_input = QTextEdit()
         self.question_input.setFixedHeight(70)
         self.question_input.setPlaceholderText("궁금한 점을 입력하세요...")
@@ -161,20 +184,26 @@ class Panel(QWidget):
         self.btn_ask = QPushButton("질문하기")
         layout.addWidget(self.btn_ask)
 
-        # 이벤트 연결
         self.btn_hint.clicked.connect(lambda: self._request("/hint"))
         self.btn_approach.clicked.connect(lambda: self._request("/approach"))
         self.btn_solution.clicked.connect(lambda: self._request("/solution"))
         self.btn_ask.clicked.connect(self._ask)
 
-        # 시작 시 문제 로드
         self._load_problem()
+
+    def _start_poller(self):
+        self.poller = ProblemPoller()
+        self.poller.problem_changed.connect(self._on_problem_changed)
+        self.poller.start()
+
+    def _on_problem_changed(self, title: str):
+        self.title_label.setText(title)
+        self.response_box.clear()
+        self.question_input.clear()
 
     def _set_loading(self, loading: bool):
         for btn in [self.btn_hint, self.btn_approach, self.btn_solution, self.btn_ask]:
             btn.setEnabled(not loading)
-        if loading:
-            self.response_box.setPlaceholderText("불러오는 중...")
 
     def _load_problem(self):
         self.worker = ApiWorker("/extract")
@@ -216,10 +245,6 @@ class Panel(QWidget):
         self.worker.error.connect(self._on_error)
         self.worker.start()
 
-    def _on_response(self, content: str):
-        self.response_box.setPlainText(content)
-        self._set_loading(False)
-
     def _on_error(self, msg: str):
         self.response_box.setPlainText(f"오류: {msg}")
         self._set_loading(False)
@@ -244,12 +269,10 @@ class FloatingWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # 패널 (기본 숨김)
         self.panel = Panel()
         self.panel.hide()
         layout.addWidget(self.panel)
 
-        # 토글 버튼
         self.toggle_btn = DraggableButton("💡")
         self.toggle_btn.setFixedSize(48, 48)
         self.toggle_btn.setStyleSheet("""
@@ -265,7 +288,6 @@ class FloatingWidget(QWidget):
         self.toggle_btn.clicked.connect(self._toggle_panel)
         layout.addWidget(self.toggle_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
-        # 종료 버튼
         self.close_btn = QPushButton("✕")
         self.close_btn.setFixedSize(24, 24)
         self.close_btn.setStyleSheet("""
@@ -284,8 +306,6 @@ class FloatingWidget(QWidget):
     def _toggle_panel(self):
         self.panel_visible = not self.panel_visible
         self.panel.setVisible(self.panel_visible)
-        if self.panel_visible and not self.panel.title_label.text().strip():
-            self.panel._load_problem()
         current_pos = self.pos()
         self.adjustSize()
         self.move(current_pos)
@@ -296,7 +316,6 @@ class FloatingWidget(QWidget):
         y = screen.bottom() - self.height() - 20
         self.move(x, y)
 
-    # 드래그로 위치 이동
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -308,14 +327,16 @@ class FloatingWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
 
+    def closeEvent(self, event):
+        if hasattr(self.panel, 'poller'):
+            self.panel.poller.stop()
+        event.accept()
+
 
 def main():
     import signal
     app = QApplication(sys.argv)
-
-    # Ctrl+C 터미널에서도 받게
     signal.signal(signal.SIGINT, lambda *_: app.quit())
-
     widget = FloatingWidget()
     widget.show()
     sys.exit(app.exec())

@@ -6,18 +6,19 @@ from io import BytesIO
 from pathlib import Path
 
 import httpx
+from openai import OpenAI
 import mss
 from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CAPTURE_WIDTH_RATIO = float(os.getenv("CAPTURE_WIDTH_RATIO", "0.42"))
 
-EXTRACT_PROMPT = """
-이 화면은 프로그래머스 코딩 테스트 문제 페이지의 좌측 영역입니다.
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+EXTRACT_PROMPT = """이 화면은 프로그래머스 코딩 테스트 문제 페이지의 좌측 영역입니다.
 화면에서 코딩 문제를 추출해서 아래 JSON 형식으로만 반환하세요.
 다른 텍스트나 마크다운 코드블록 없이 JSON만 반환하세요.
 
@@ -35,8 +36,7 @@ EXTRACT_PROMPT = """
     "is_coding_problem": true
 }
 
-코딩 문제 화면이 아니면 is_coding_problem을 false로 설정하세요.
-"""
+코딩 문제 화면이 아니면 is_coding_problem을 false로 설정하세요."""
 
 
 def capture_left_half() -> Image.Image:
@@ -58,54 +58,41 @@ def image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def call_gemini_vision(img: Image.Image) -> dict:
-    payload = {
-        "contents": [
+def call_vision(img: Image.Image) -> dict:
+    img_b64 = image_to_base64(img)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
             {
-                "parts": [
-                    {"text": EXTRACT_PROMPT},
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": EXTRACT_PROMPT},
                     {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": image_to_base64(img),
-                        }
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
                     },
-                ]
+                ],
             }
         ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 4096,
-        },
-    }
-
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-        )
-        response.raise_for_status()
-
-    raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    raw_text = re.sub(r"^```(?:json)?\s*\n?", "", raw_text)
-    raw_text = re.sub(r"\n?```\s*$", "", raw_text).strip()
-
-    return json.loads(raw_text)
+        max_tokens=4096,
+        temperature=0.1,
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+    raw = re.sub(r"\n?```\s*$", "", raw).strip()
+    return json.loads(raw)
 
 
 def main():
-    if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY not set")
+    if not OPENAI_API_KEY:
+        print("OPENAI_API_KEY not set")
         return
 
     img = capture_left_half()
-
     Path("poc/output").mkdir(parents=True, exist_ok=True)
     img.save("poc/output/screenshot.png")
 
-    result = call_gemini_vision(img)
-
+    result = call_vision(img)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     with open("poc/output/extracted_problem.json", "w", encoding="utf-8") as f:

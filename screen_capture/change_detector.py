@@ -1,35 +1,23 @@
 import asyncio
-import imagehash
-from PIL import Image
-from .capture import capture_left_half
+from .title_reader import read_title
 
 
-async def start_monitor(on_change, interval: float = 2.0, threshold: int = 10):
-    prev_hash = None
+async def start_monitor(on_change, on_title_change, interval: float = 2.0, threshold: int = 10):
+    prev_title = ""
 
-    # 시작하자마자 한 번 즉시 캡처
+    # 시작 시 즉시 로드
     try:
-        img = capture_left_half()
-        await on_change(img)
+        await on_change()
     except Exception as e:
-        print(f"initial capture error: {e}")
+        print(f"initial fetch error: {e}")
 
     while True:
         try:
-            img = capture_left_half()
-            current_hash = imagehash.phash(img)
-
-            if prev_hash is not None:
-                diff = current_hash - prev_hash
-                if diff >= threshold:
-                    await on_change(img)
-                    await asyncio.sleep(3.0)
-                    prev_hash = None
-                    continue
-
-            prev_hash = current_hash
-
+            title = read_title()
+            if title and title != prev_title:
+                prev_title = title
+                await on_title_change(title)
         except Exception as e:
             print(f"monitor error: {e}")
 
-        await asyncio.sleep(interval)
+        await asyncio.sleep(0.5)

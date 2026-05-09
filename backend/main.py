@@ -11,8 +11,8 @@ from fastapi import FastAPI, HTTPException
 from .schemas.models import AssistRequest, AssistResponse, AskRequest, Problem
 from .config import CAPTURE_INTERVAL, CHANGE_THRESHOLD, LLM_PROVIDER
 from screen_capture.capture import capture_left_half
-from screen_capture.extractor import extract_problem
 from screen_capture.change_detector import start_monitor
+from screen_capture.problem_fetcher import fetch_problem_by_url, get_title_from_window
 
 if LLM_PROVIDER == "openai":
     from .llm.openai_client import OpenAIClient
@@ -39,27 +39,34 @@ def _load_cache():
 _load_cache()
 
 
-async def on_problem_change(img):
+async def on_problem_change():
     try:
-        result = await extract_problem(img)
-        if result.get("is_coding_problem"):
-            problem_cache.clear()
-            problem_cache.update(result)
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-            print(f"problem updated: {result.get('title', '-')}")
+        result = await fetch_problem_by_url()
+        title = result.get("title", "")
+        if not result.get("is_coding_problem") or not title:
+            return
+        problem_cache.clear()
+        problem_cache.update(result)
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        print(f"problem updated: {title}")
     except Exception as e:
-        if "429" not in str(e):
-            print(f"extract error: {e}")
+        print(f"fetch error: {e}")
 
+
+async def on_title_change(title: str):
+    if title and title != problem_cache.get("title", ""):
+        problem_cache["title"] = title
+        print(f"title updated: {title}")
+        await on_problem_change()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(
-        start_monitor(on_problem_change, CAPTURE_INTERVAL, CHANGE_THRESHOLD)
+        start_monitor(on_problem_change, on_title_change, CAPTURE_INTERVAL, CHANGE_THRESHOLD)
     )
     yield
     task.cancel()
@@ -99,8 +106,7 @@ async def get_current_problem():
     if problem_cache:
         return problem_cache
     try:
-        img = capture_left_half()
-        result = await extract_problem(img)
+        result = await fetch_problem_by_url()
         if result.get("is_coding_problem"):
             problem_cache.update(result)
             CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -150,3 +156,10 @@ async def stream_ask(req: AskRequest):
         async for chunk in llm.stream_ask(problem, req.question, req.context or ""):
             yield {"data": chunk}
     return EventSourceResponse(generate())
+
+@app.get("/status")
+async def get_status():
+    return {
+        "title": problem_cache.get("title", ""),
+        "has_problem": bool(problem_cache),
+    }
