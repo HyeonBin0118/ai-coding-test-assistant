@@ -7,6 +7,13 @@ from .capture import capture_left_half
 async def start_monitor(on_change, interval: float = 2.0, threshold: int = 10):
     prev_hash = None
 
+    # 시작하자마자 한 번 즉시 캡처
+    try:
+        img = capture_left_half()
+        await on_change(img)
+    except Exception as e:
+        print(f"initial capture error: {e}")
+
     while True:
         try:
             img = capture_left_half()

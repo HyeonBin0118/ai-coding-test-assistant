@@ -72,6 +72,8 @@ class GeminiClient(BaseLLMClient):
                 params={"key": GEMINI_API_KEY},
                 json=payload,
             )
+            if response.status_code == 429:
+                raise Exception("API 호출 한도 초과 (무료 티어 분당 15회 제한). 잠시 후 다시 시도하세요.")
             response.raise_for_status()
 
         return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()

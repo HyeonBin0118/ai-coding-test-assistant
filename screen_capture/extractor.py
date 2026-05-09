@@ -2,15 +2,13 @@ import os
 import re
 import json
 import base64
-import httpx
 from io import BytesIO
 from PIL import Image
+from openai import AsyncOpenAI
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-EXTRACT_PROMPT = """
-이 화면은 프로그래머스 코딩 테스트 문제 페이지의 좌측 영역입니다.
+EXTRACT_PROMPT = """이 화면은 프로그래머스 코딩 테스트 문제 페이지의 좌측 영역입니다.
 화면에서 코딩 문제를 추출해서 아래 JSON 형식으로만 반환하세요.
 다른 텍스트나 마크다운 코드블록 없이 JSON만 반환하세요.
 
@@ -28,8 +26,7 @@ EXTRACT_PROMPT = """
     "is_coding_problem": true
 }
 
-코딩 문제 화면이 아니면 is_coding_problem을 false로 설정하세요.
-"""
+코딩 문제 화면이 아니면 is_coding_problem을 false로 설정하세요."""
 
 
 def _image_to_base64(img: Image.Image) -> str:
@@ -39,32 +36,27 @@ def _image_to_base64(img: Image.Image) -> str:
 
 
 async def extract_problem(img: Image.Image) -> dict:
-    payload = {
-        "contents": [
+    img_b64 = _image_to_base64(img)
+
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
             {
-                "parts": [
-                    {"text": EXTRACT_PROMPT},
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": EXTRACT_PROMPT},
                     {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": _image_to_base64(img),
-                        }
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
                     },
-                ]
+                ],
             }
         ],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
-    }
+        max_tokens=4096,
+        temperature=0.1,
+    )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-        )
-        response.raise_for_status()
-
-    raw = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
     raw = re.sub(r"\n?```\s*$", "", raw).strip()
 
