@@ -423,7 +423,7 @@ class FloatingWidget(QWidget):
         bar_layout.setSpacing(8)
 
         self.bar_label = QLabel("AI_Coding_Assistant")
-        self.bar_label.setStyleSheet("color: #6c7086; font-size: 12px; background: transparent;")
+        self.bar_label.setStyleSheet("color: #a6e3a1; font-size: 12px; background: transparent;")
         bar_layout.addWidget(self.bar_label)
         bar_layout.addStretch()
 
