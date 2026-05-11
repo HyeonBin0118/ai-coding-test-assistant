@@ -81,16 +81,12 @@ class ApiWorker(QThread):
                     self.finished.emit(content)
                 return
 
-            try:
-                with httpx.Client(timeout=3.0) as client:
-                    res = client.post(f"{API_BASE}{self.endpoint}", json=self.payload)
-                    if res.status_code == 200:
-                        data = res.json()
-                        if data.get("content"):
-                            self.finished.emit(data["content"])
-                            return
-            except httpx.TimeoutException:
-                pass
+            if self.endpoint == "/prefetch":
+                with httpx.Client(timeout=60.0) as client:
+                    res = client.post(f"{API_BASE}/prefetch", json=self.payload)
+                    res.raise_for_status()
+                    self.finished.emit("")
+                return
 
             stream_endpoint = self.endpoint + "/stream"
             with httpx.Client(timeout=60.0) as client:
@@ -105,7 +101,6 @@ class ApiWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
-
 
 class ProblemPoller(QThread):
     problem_changed = pyqtSignal(str)
@@ -316,6 +311,11 @@ class Panel(QWidget):
         self.title_label.setText(title)
         self.response_box.clear()
         self.question_input.clear()
+        # 세 개 동시 프리패치
+        self._prefetch_worker = ApiWorker("/prefetch", {})
+        self._prefetch_worker.finished.connect(lambda _: None)
+        self._prefetch_worker.error.connect(lambda _: None)
+        self._prefetch_worker.start()
 
     def _set_loading(self, loading: bool):
         for btn in [self.btn_hint, self.btn_approach, self.btn_solution, self.btn_ask]:
@@ -369,6 +369,14 @@ class Panel(QWidget):
 
     def _on_chunk(self, chunk: str):
         self._streaming_buffer += chunk
+        # 첫 청크 도착 시 loading 숨기고 바로 표시
+        if self.loading_label.isVisible():
+            self._loading_timer.stop()
+            self.loading_label.hide()
+            self.response_box.show()
+        # solution은 코드 하이라이팅 때문에 마지막에 한번에
+        if self._current_endpoint != "/solution":
+            self.response_box.setHtml(render_markdown(self._streaming_buffer))
 
     def _on_response(self, content: str):
         text = content if content else self._streaming_buffer

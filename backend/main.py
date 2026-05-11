@@ -163,32 +163,58 @@ async def ask(req: AskRequest):
     return AssistResponse(content=content, provider=LLM_PROVIDER)
 
 
-def _stream(generator):
+def _stream_with_cache(cache_key: str, generator):
+    """스트리밍하면서 동시에 캐시에 저장"""
     async def gen():
+        if cache_key in response_cache:
+            yield {"data": response_cache[cache_key]}
+            return
+        full = ""
         async for chunk in generator:
+            full += chunk
             yield {"data": chunk}
+        response_cache[cache_key] = full
     return EventSourceResponse(gen())
 
 
 @app.post("/hint/stream")
 async def stream_hint(req: AssistRequest):
     problem = await resolve_problem(req.problem)
-    return _stream(llm.stream_hint(problem))
+    return _stream_with_cache("hint", llm.stream_hint(problem))
 
 
 @app.post("/approach/stream")
 async def stream_approach(req: AssistRequest):
     problem = await resolve_problem(req.problem)
-    return _stream(llm.stream_approach(problem))
+    return _stream_with_cache("approach", llm.stream_approach(problem))
 
 
 @app.post("/solution/stream")
 async def stream_solution(req: AssistRequest):
     problem = await resolve_problem(req.problem)
-    return _stream(llm.stream_solution(problem))
+    return _stream_with_cache("solution", llm.stream_solution(problem))
 
 
 @app.post("/ask/stream")
 async def stream_ask(req: AskRequest):
     problem = await resolve_problem(req.problem)
-    return _stream(llm.stream_ask(problem, req.question, req.context or ""))
+    async def gen():
+        async for chunk in llm.stream_ask(problem, req.question, req.context or ""):
+            yield {"data": chunk}
+    return EventSourceResponse(gen())
+
+@app.post("/prefetch")
+async def prefetch(req: AssistRequest):
+    """문제 감지 시 hint/approach/solution 미리 생성해 캐시에 저장"""
+    problem = await resolve_problem(req.problem)
+    results = await asyncio.gather(
+        llm.get_hint(problem),
+        llm.get_approach(problem),
+        llm.get_solution(problem),
+        return_exceptions=True
+    )
+    keys = ["hint", "approach", "solution"]
+    for key, result in zip(keys, results):
+        if not isinstance(result, Exception):
+            response_cache[key] = result
+    return {"status": "ok", "cached": [k for k, r in zip(keys, results) if not isinstance(r, Exception)]}
