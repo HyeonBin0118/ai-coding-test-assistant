@@ -19,6 +19,9 @@ from screen_capture.problem_fetcher import fetch_problem_by_url
 if LLM_PROVIDER == "openai":
     from .llm.openai_client import OpenAIClient
     llm = OpenAIClient()
+elif LLM_PROVIDER == "local":
+    from .llm.local_client import LocalClient
+    llm = LocalClient()
 else:
     from .llm.gemini_client import GeminiClient
     llm = GeminiClient()
