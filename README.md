@@ -23,10 +23,11 @@
 - 같은 문제 재요청 시 캐시 히트로 즉시 응답
 - 문제 변경 자동 감지 → UI 제목 실시간 동기화
 - 드래그 가능한 플로팅 위젯 (항상 위, 어디서든 호출)
+- GPT-4o-mini ↔ 자체 파인튜닝 모델(Qwen2.5-Coder-7B) Provider 토글
 
 ## 🛠️ 기술 스택
 
-`Python` `FastAPI` `PyQt6` `Playwright` `OpenAI GPT-4o-mini` `pywinauto` `Pygments` `SSE` `asyncio`
+`Python` `FastAPI` `PyQt6` `Playwright` `OpenAI GPT-4o-mini` `Qwen2.5-Coder-7B (자체 파인튜닝)` `pywinauto` `Pygments` `SSE` `asyncio`
 
 ---
 
@@ -107,6 +108,9 @@
 if LLM_PROVIDER == "openai":
     from .llm.openai_client import OpenAIClient
     llm = OpenAIClient()
+elif LLM_PROVIDER == "local":
+    from .llm.local_client import LocalClient
+    llm = LocalClient()
 else:
     from .llm.gemini_client import GeminiClient
     llm = GeminiClient()
@@ -143,9 +147,10 @@ UI에서도 이를 반영해 **캐시 히트는 일반 POST(3초 타임아웃), 
 
 2026/05/11 +
 이후 추가 개선으로 문제가 감지되는 순간 hint·approach·solution 세 개를 `asyncio.gather`로 동시에 백그라운드 생성해두는 프리패치 구조를 도입했다.
-사용자가 패널을 열고 버튼을 누를 때쯤엔 이미 캐시가 완성돼 있어, 처음 요청임에도 즉시 응답이 나온다.
+사용자가 패널을 열고 버튼을 누를 때쯔엔 이미 캐시가 완성돼 있어, 처음 요청임에도 즉시 응답이 나온다.
 
 스트리밍 엔드포인트(`/hint/stream` 등)에도 캐시를 적용해 캐시 히트 시 스트리밍 없이 단일 청크로 즉시 반환한다.
+
 ---
 
 ### 5. UI 렌더링: 스트리밍 ↔ 마크다운의 결합
@@ -171,6 +176,7 @@ LLM 응답을 한 글자씩 보여주면 체감 속도가 좋지만, 마크다�
 
 캐시 히트 여부를 서버에서 판단할 수 있으므로, 클라이언트는 항상 스트리밍 엔드포인트만 호출하는 방식으로 단순화했다.
 캐시 히트면 서버가 즉시 단일 청크로 응답하고, 미스면 LLM 응답을 그대로 스트리밍한다.
+
 ---
 
 ### 6. 도입 검토 후 보류한 것: RAG
@@ -182,6 +188,38 @@ RAG 컨텍스트 주입의 marginal한 품질 개선보다 시스템 복잡도 �
 고난도 백준 문제 같은 곳에서 실효성 검증 후 도입할 예정이다.
 
 기능 도입 자체보다 **"필요할 때 도입한다"는 판단**이 더 중요하다고 봤다.
+
+---
+
+### 7. LLM Provider 확장: 자체 파인튜닝 모델 연동
+
+GPT-4o-mini 외에 직접 파인튜닝한 모델([coder-llm-finetune](https://github.com/HyeonBin0118/coder-llm-finetune))도 같은 인터페이스로 선택할 수 있도록 확장했다.
+`BaseLLMClient` 추상화를 처음부터 잘 잡아둔 덕에, 이번에도 `.env`의 `LLM_PROVIDER` 한 줄만 바꾸면 전환된다.
+
+**초기 계획: vLLM 서버**
+
+로컬 모델을 OpenAI 호환 API로 서빙하려면 vLLM이 표준적인 선택이다. LoRA 어댑터를 베이스 모델에 merge한 뒤, AWQ로 4bit 양자화해서 vLLM에 올리는 계획을 세웠다.
+
+**한계: vLLM/AutoAWQ는 Windows를 정식 지원하지 않음**
+
+`autoawq` 설치 단계에서 빌드 의존성 문제로 막혔고, 이후 단계(vLLM의 CUDA 커널 컴파일)에서도 같은 종류의 문제가 반복될 게 명확했다. vLLM 생태계 자체가 Linux/WSL2 기준으로 만들어져 있어, Windows 네이티브 환경에서는 의존성 컴파일이 근본적으로 불안정하다.
+
+**해결: OpenAI 호환 레이어를 직접 구현**
+
+vLLM 없이, FastAPI로 `/v1/chat/completions` 엔드포인트 하나만 직접 흉내 내는 경량 서버([`serve_v5.py`](https://github.com/HyeonBin0118/coder-llm-finetune/blob/main/serve_v5.py))를 만들었다. 모델 로딩은 학습·평가 단계에서 이미 검증된 `transformers + bitsandbytes` 4bit 방식을 그대로 재사용해, 추가 컴파일 의존성이 전혀 없다.
+
+```python
+class LocalClient(BaseLLMClient):
+    """coder-llm-finetune에서 파인튜닝한 모델을 자체 구현한
+    OpenAI 호환 서버(serve_v5.py)로 호출하는 클라이언트."""
+    # OpenAIClient와 동일한 프롬프트를 그대로 재사용, base_url만 로컬 서버로 교체
+```
+
+`AsyncOpenAI(base_url=...)`는 엔드포인트가 OpenAI 형식만 지키면 어떤 서버든 호출할 수 있어서, vLLM이든 직접 만든 서버든 `LocalClient` 코드는 한 글자도 바뀌지 않는다.
+
+**현재 한계와 기본값 정책**
+
+자체 평가([coder-llm-finetune 실험 기록](https://github.com/HyeonBin0118/coder-llm-finetune) 참고) 결과, 파인튜닝 모델의 코드 정답률은 약 43~57% 수준으로 GPT-4o-mini보다 낮다. 이 때문에 **기본 Provider는 `openai`로 유지**하고, `local`은 무료/오프라인 동작과 "Provider 전환 가능"한 구조를 보여주는 옵션으로 남겨뒀다.
 
 ---
 
@@ -198,17 +236,20 @@ RAG 컨텍스트 주입의 marginal한 품질 개선보다 시스템 복잡도 �
        │                    │       ↓              │  /approach          │
        │ Playwright         │ Provider 추상화      │  /solution          │
        └─(HTML 파싱)────────┤  ↓                   │  /ask    │          │
-                            │ OpenAIClient         │ ←스트리밍 └──────────┘
+                            │ OpenAIClient /       │ ←스트리밍 └──────────┘
+                            │ LocalClient          │
                             └──────────────────────┘
 ```
 
 `change_detector`가 0.5초마다 활성 창 제목을 폴링해 프로그래머스 탭 변경을 감지한다.
 변경 시 `problem_fetcher`가 크롬 주소창에서 URL을 읽고 Playwright로 문제 전문을 추출해 `problem_cache`에 저장한다.
 UI는 2초마다 `/status`를 폴링해 제목을 동기화하고, 사용자가 버튼을 누르면 캐시된 문제 정보를 사용해 LLM에 요청한다.
+`LLM_PROVIDER` 환경변수에 따라 `OpenAIClient`, `GeminiClient`, `LocalClient` 중 하나가 선택되며, 셋 모두 같은 `BaseLLMClient` 인터페이스를 구현한다.
 
-2026/05/11 + 
+2026/05/11 +
 문제가 감지되는 즉시 `/prefetch`를 호출해 hint·approach·solution을 병렬로 미리 생성한다.
 사용자가 버튼을 누르기 전에 캐시가 준비되므로 첫 요청도 즉시 응답된다.
+
 ---
 
 ## 🚀 실행
@@ -225,10 +266,12 @@ playwright install chromium
 # 3. 환경 변수
 cp .env.example .env
 # OPENAI_API_KEY 입력 (또는 GEMINI_API_KEY + LLM_PROVIDER=gemini)
+# 자체 파인튜닝 모델을 쓰려면 LLM_PROVIDER=local + coder-llm-finetune의 serve_v5.py 실행 필요
 
-# 4. 실행 (터미널 두 개)
+# 4. 실행 (터미널 두 개, local Provider 사용 시 세 개)
 uvicorn backend.main:app --reload      # 백엔드
 python ui/floating_widget.py            # UI
+# python serve_v5.py  (coder-llm-finetune 레포에서, LLM_PROVIDER=local일 때만)
 ```
 
 프로그래머스 문제 페이지를 크롬에서 연 상태로 위젯의 `[힌트]` `[접근법]` `[정답 보기]` 중 원하는 버튼을 누르면 된다.
@@ -241,6 +284,7 @@ python ui/floating_widget.py            # UI
   현재는 conda 환경 + 두 터미널 명령으로 실행해야 한다. Playwright Chromium 바이너리(~200MB) 번들링 처리가 필요해 별도 작업 예정.
 - **다른 사이트 지원**: 백준, 리트코드. Playwright 셀렉터만 추가하면 가능한 구조.
 - **RAG 도입 재검토**: 더 까다로운 문제군에서 효과를 검증한 후 결정.
+- **로컬 모델 정답률 개선**: coder-llm-finetune 쪽에서 추가 실험으로 코드 정답률을 끌어올리면, `local`을 기본 Provider로 전환 검토.
 
 ---
 
@@ -255,7 +299,8 @@ ai-coding-test-assistant/
 │   └── llm/
 │       ├── base.py              # Provider 추상 클래스
 │       ├── openai_client.py     # GPT-4o-mini 구현
-│       └── gemini_client.py     # Gemini 2.5 Flash 구현
+│       ├── gemini_client.py     # Gemini 2.5 Flash 구현
+│       └── local_client.py      # 자체 파인튜닝 모델(coder-llm-finetune) 구현
 ├── screen_capture/
 │   ├── problem_fetcher.py       # URL 추출 + Playwright HTML 파싱
 │   └── change_detector.py       # 활성 탭 제목 폴링
